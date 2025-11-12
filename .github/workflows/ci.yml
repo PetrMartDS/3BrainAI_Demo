@@ -6,6 +6,7 @@ on:
 jobs:
   test_python_db:
     runs-on: ubuntu-latest
+
     services:
       postgres:
         image: postgres:16
@@ -19,38 +20,72 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+
       clickhouse:
         image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_USER: etl
+          CLICKHOUSE_PASSWORD: etl
+          CLICKHOUSE_DB: default
         ports: ["8123:8123", "9000:9000"]
         options: >-
-          --health-cmd "bash -c 'echo \"SELECT 1\" | clickhouse-client || exit 1'"
+          --health-cmd "bash -c 'echo \"SELECT 1\" | clickhouse-client --user etl --password etl || exit 1'"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
 
+    env:
+      POSTGRES_URL: postgresql+psycopg://etl:etl@localhost:5432/etldb
+      CLICKHOUSE_HOST: localhost
+      CLICKHOUSE_HTTP_PORT: "8123"
+      CLICKHOUSE_USER: etl
+      CLICKHOUSE_PASSWORD: etl
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
-          pip install sqlalchemy psycopg[binary] clickhouse-connect
+          python -m pip install -U pip
+          pip install sqlalchemy psycopg[binary] clickhouse-connect pandas pytest
 
-      - name: Test Postgres and ClickHouse connections
+      - name: Smoke-test Postgres & ClickHouse
         run: |
           python - <<'PY'
           import sqlalchemy as sa
+          from sqlalchemy import text
           import clickhouse_connect
 
-          print("Connecting to Postgres...")
-          pg = sa.create_engine("postgresql+psycopg://etl:etl@localhost:5432/etldb", future=True)
+          print("== Postgres ==")
+          pg = sa.create_engine("${{ env.POSTGRES_URL }}", future=True)
           with pg.begin() as conn:
-              result = conn.execute(sa.text("SELECT 1"))
-              print("Postgres result:", result.scalar())
+              v = conn.execute(text("SELECT 1")).scalar()
+              print("SELECT 1 ->", v)
+              conn.execute(text("CREATE SCHEMA IF NOT EXISTS raw"))
+              conn.execute(text("CREATE SCHEMA IF NOT EXISTS curated"))
+          print("Postgres OK\n")
 
-          print("Connecting to ClickHouse...")
-          ch = clickhouse_connect.get_client(host="localhost", port=8123)
-          print("ClickHouse version:", ch.command("SELECT version()"))
+          print("== ClickHouse ==")
+          ch = clickhouse_connect.get_client(
+              host="${{ env.CLICKHOUSE_HOST }}",
+              port=int("${{ env.CLICKHOUSE_HTTP_PORT }}"),
+              username="${{ env.CLICKHOUSE_USER }}",
+              password="${{ env.CLICKHOUSE_PASSWORD }}"
+          )
+          ver = ch.command("SELECT version()")
+          print("version ->", ver)
+          ch.command("CREATE DATABASE IF NOT EXISTS curated")
+          ch.command("""
+            CREATE TABLE IF NOT EXISTS curated.healthcheck
+            (sku String, has_color UInt8)
+            ENGINE = MergeTree ORDER BY sku
+          """)
+          ch.insert("curated.healthcheck", [["X", 1], ["Y", 0]], column_names=["sku","has_color"])
+          count = ch.query("SELECT count() FROM curated.healthcheck").result_rows[0][0]
+          print("healthcheck rows ->", count)
+          print("ClickHouse OK")
           PY
